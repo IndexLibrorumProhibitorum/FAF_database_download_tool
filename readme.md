@@ -17,6 +17,9 @@ A desktop tool for downloading data from the [Forged Alliance Forever](https://w
 - **Settings persistence** — remembers your last-used options between sessions
 - **OAuth authentication** — full browser-based login flow against the FAF Hydra OAuth server, with automatic token refresh
 
+<img width="550" height="658" alt="image" src="https://github.com/user-attachments/assets/82762dca-f48d-4bf1-9dd7-91efb6a41b9b" />
+
+
 ---
 
 ## Requirements
