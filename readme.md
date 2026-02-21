@@ -1,4 +1,4 @@
-# FAF Data Downloaderhttps://github.com/IndexLibrorumProhibitorum/FAF_database_download_tool/tree/master
+# FAF Data Downloader
 
 A desktop tool for downloading data from the [Forged Alliance Forever](https://www.faforever.com/) API. Built with Python and Tkinter, it supports pagination, date-range filtering, chunked output files, download resumption, and a history log.
 
