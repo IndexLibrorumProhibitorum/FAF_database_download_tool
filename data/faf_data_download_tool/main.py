@@ -6,207 +6,29 @@ import sys
 import time
 import threading
 from datetime import datetime, date
-from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkcalendar import DateEntry   # pip install tkcalendar
 
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 from auth import FAFAuthClient
 from client import FAFClient
 from config import *
-from utils import jsonapi_to_dataframe, convert_datetime_columns
+from data.faf_data_download_tool.utils_filters import build_filter, date_to_filter_value
+from data.faf_data_download_tool.utils_history import load_settings, save_settings, load_history, append_history, \
+    format_duration
+from utils_dataframe import jsonapi_to_dataframe, convert_datetime_columns
+from utils_filewriters import make_writer
 
+
+###############################
+#   INIT
+###############################
 logger = logging.getLogger(__name__)
-
-CHUNK_STATE_FILE  = Path("chunk_state.json")
-SETTINGS_FILE     = Path("settings.json")
-HISTORY_FILE      = Path("download_history.json")
-
-API_MAX_PAGE_SIZE = 10_000
-DEFAULT_CHUNK_PAGES = 10
-
-ENDPOINT_META = {
-    "Players": ("/data/player", "player", "createTime"),
-    "Games": ("/data/game", "game", "startTime"),
-    "Maps": ("/data/map", "map", "createTime"),
-    "GamePlayerStats": ("/data/gamePlayerStats", "gamePlayerStats", "scoreTime"),
-    "leaderboard": ("/data/leaderboard", "leaderboard", "createTime"),
-    "leaderboardRatingJournal": ("/data/leaderboardRatingJournal", "leaderboardRatingJournal", "createTime"),
-    "Reports": ("/data/moderationReport", "moderationReport", "createTime"),
-    "Bans": ("/data/banInfo", "banInfo", "createTime"),
-}
-
 ENDPOINTS = {name: meta[0] for name, meta in ENDPOINT_META.items()}
 
-# Settings keys that are persisted to disk
-SETTINGS_KEYS = [
-    "endpoint", "page_size", "max_pages", "filter", "include",
-    "newest_first", "format", "chunk_pages", "all_in_range",
-]
-
-
-# ---------------------------------------------------------------------------
-# Chunked writers
-# ---------------------------------------------------------------------------
-
-class ChunkedParquetWriter:
-    def __init__(self, path: str, resume: bool = False) -> None:
-        self.path = path
-        self._writer: pq.ParquetWriter | None = None
-        if not resume and os.path.exists(path):
-            os.remove(path)
-
-    def write(self, df: pd.DataFrame) -> None:
-        table = pa.Table.from_pandas(df, preserve_index=False)
-        if self._writer is None:
-            self._writer = pq.ParquetWriter(self.path, table.schema)
-        self._writer.write_table(table)
-
-    def close(self) -> None:
-        if self._writer:
-            self._writer.close()
-            self._writer = None
-
-
-class ChunkedCSVWriter:
-    def __init__(self, path: str, resume: bool = False) -> None:
-        self.path = path
-        if not resume:
-            open(self.path, "w").close()
-            self._header_written = False
-        else:
-            self._header_written = os.path.exists(path)
-
-    def write(self, df: pd.DataFrame) -> None:
-        df.to_csv(self.path, mode="a", index=False, header=not self._header_written)
-        self._header_written = True
-
-    def close(self) -> None:
-        pass
-
-
-class ChunkedJSONWriter:
-    def __init__(self, path: str, resume: bool = False) -> None:
-        self.path = path
-        self._need_comma = False
-        if resume and os.path.exists(path):
-            with open(self.path, "rb+") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                for back in range(1, min(20, size)):
-                    f.seek(-back, 2)
-                    if f.read(1) == b"]":
-                        f.seek(-back, 2)
-                        f.truncate()
-                        break
-            self._need_comma = True
-        else:
-            with open(self.path, "w", encoding="utf-8") as f:
-                f.write("[\n")
-
-    def write(self, df: pd.DataFrame) -> None:
-        with open(self.path, "a", encoding="utf-8") as f:
-            for rec in df.to_dict(orient="records"):
-                if self._need_comma:
-                    f.write(",\n")
-                f.write(json.dumps(rec, default=str))
-                self._need_comma = True
-
-    def close(self) -> None:
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write("\n]\n")
-
-
-def make_writer(fmt: str, path: str, resume: bool):
-    if fmt == "parquet":
-        return ChunkedParquetWriter(path, resume=resume)
-    elif fmt == "csv":
-        return ChunkedCSVWriter(path, resume=resume)
-    elif fmt == "json":
-        return ChunkedJSONWriter(path, resume=resume)
-    raise ValueError(f"Unknown format: {fmt}")
-
-
-# ---------------------------------------------------------------------------
-# Filter helpers
-# ---------------------------------------------------------------------------
-
-def build_filter(predicates: list[str], extra: str) -> dict:
-    """
-    filter=field=ge="2025-01-01T00:00:00Z";field=le="2025-10-31T00:00:00Z"
-    Extra RSQL predicates from the user are appended with ;
-    """
-    all_parts = list(predicates)
-    raw = extra.strip()
-    if raw:
-        all_parts.extend(p.strip() for p in raw.split(";") if p.strip())
-    if not all_parts:
-        return {}
-    return {"filter": ";".join(all_parts)}
-
-
-def date_to_filter_value(d: date) -> str:
-    return f'"{datetime(d.year, d.month, d.day).strftime("%Y-%m-%dT%H:%M:%SZ")}"'
-
-
-# ---------------------------------------------------------------------------
-# Settings & history persistence
-# ---------------------------------------------------------------------------
-
-def load_settings() -> dict:
-    try:
-        if SETTINGS_FILE.exists():
-            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
-
-
-def save_settings(data: dict) -> None:
-    try:
-        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def load_history() -> list:
-    try:
-        if HISTORY_FILE.exists():
-            return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return []
-
-
-def append_history(entry: dict) -> None:
-    try:
-        history = load_history()
-        history.insert(0, entry)
-        history = history[:50]   # keep last 50 entries
-        HISTORY_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def format_duration(seconds: float) -> str:
-    seconds = int(seconds)
-    if seconds < 60:
-        return f"{seconds}s"
-    elif seconds < 3600:
-        return f"{seconds // 60}m {seconds % 60}s"
-    else:
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        return f"{h}h {m}m"
-
-
-# ---------------------------------------------------------------------------
-# GUI
-# ---------------------------------------------------------------------------
+###############################
+#   GUI
+###############################
 
 class FAFDataApp:
     def __init__(self, root: tk.Tk) -> None:
@@ -257,7 +79,7 @@ class FAFDataApp:
 
         # ---- Page size ----
         ttk.Label(frame, text=f"Page size (max {API_MAX_PAGE_SIZE:,})").grid(row=row, column=0, sticky="w", **pad)
-        self.page_size_var = tk.StringVar(value="10000")
+        self.page_size_var = tk.StringVar(value=str(DEFAULT_PAGE_SIZE))
         ttk.Entry(frame, textvariable=self.page_size_var, width=10).grid(row=row, column=1, sticky="w", **pad)
         row += 1
 
@@ -369,8 +191,6 @@ class FAFDataApp:
 
         self.open_btn = ttk.Button(btn_frame, text="Open output folder", command=self._open_output_file, state="disabled")
         self.open_btn.pack(side="left", padx=4)
-
-
 
         frame.columnconfigure(1, weight=1)
 
