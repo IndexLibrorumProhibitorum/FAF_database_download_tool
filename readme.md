@@ -97,6 +97,12 @@ If a download is stopped (via the Stop button or a crash), check **Resume previo
 
 ---
 
+## Known limitations
+
+The FAF API is ratelimited and enforces a maximum pagesize. Accounts that do not have special priviledges will be limited too pagesizes with a maximum of 100 results. 
+
+---
+
 ## License
 
 MIT
