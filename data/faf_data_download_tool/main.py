@@ -1,6 +1,9 @@
 import json
 import logging
 import os
+import subprocess
+import sys
+import time
 import threading
 from datetime import datetime, date
 from pathlib import Path
@@ -19,14 +22,13 @@ from utils import jsonapi_to_dataframe, convert_datetime_columns
 
 logger = logging.getLogger(__name__)
 
-CHUNK_STATE_FILE = Path("chunk_state.json")
+CHUNK_STATE_FILE  = Path("chunk_state.json")
+SETTINGS_FILE     = Path("settings.json")
+HISTORY_FILE      = Path("download_history.json")
 
 API_MAX_PAGE_SIZE = 10_000
 DEFAULT_CHUNK_PAGES = 10
 
-# (path, elide_type_name, date_field_for_filtering)
-# elide_type_name is the entity name used in filter[TYPE]=...
-# date_field is None for endpoints that don't support date filtering.
 ENDPOINT_META = {
     "Players": ("/data/player", "player", "createTime"),
     "Games": ("/data/game", "game", "startTime"),
@@ -40,18 +42,21 @@ ENDPOINT_META = {
 
 ENDPOINTS = {name: meta[0] for name, meta in ENDPOINT_META.items()}
 
+# Settings keys that are persisted to disk
+SETTINGS_KEYS = [
+    "endpoint", "page_size", "max_pages", "filter", "include",
+    "newest_first", "format", "chunk_pages", "all_in_range",
+]
+
 
 # ---------------------------------------------------------------------------
 # Chunked writers
 # ---------------------------------------------------------------------------
 
 class ChunkedParquetWriter:
-    """Appends DataFrames to a single Parquet file via pyarrow."""
-
     def __init__(self, path: str, resume: bool = False) -> None:
         self.path = path
         self._writer: pq.ParquetWriter | None = None
-        # On a fresh (non-resume) start, delete any existing file so we start clean.
         if not resume and os.path.exists(path):
             os.remove(path)
 
@@ -68,24 +73,16 @@ class ChunkedParquetWriter:
 
 
 class ChunkedCSVWriter:
-    """Appends DataFrames to a CSV file, writing the header only once."""
-
     def __init__(self, path: str, resume: bool = False) -> None:
         self.path = path
         if not resume:
-            # Overwrite: truncate any existing file and write fresh.
             open(self.path, "w").close()
             self._header_written = False
         else:
             self._header_written = os.path.exists(path)
 
     def write(self, df: pd.DataFrame) -> None:
-        df.to_csv(
-            self.path,
-            mode="a",
-            index=False,
-            header=not self._header_written,
-        )
+        df.to_csv(self.path, mode="a", index=False, header=not self._header_written)
         self._header_written = True
 
     def close(self) -> None:
@@ -93,34 +90,27 @@ class ChunkedCSVWriter:
 
 
 class ChunkedJSONWriter:
-    """Streams records as a JSON array, chunk by chunk."""
-
     def __init__(self, path: str, resume: bool = False) -> None:
         self.path = path
         self._need_comma = False
-
         if resume and os.path.exists(path):
-            # Trim the trailing "]\n" so we can keep appending.
             with open(self.path, "rb+") as f:
                 f.seek(0, 2)
                 size = f.tell()
                 for back in range(1, min(20, size)):
                     f.seek(-back, 2)
-                    ch = f.read(1)
-                    if ch == b"]":
+                    if f.read(1) == b"]":
                         f.seek(-back, 2)
                         f.truncate()
                         break
             self._need_comma = True
         else:
-            # Fresh start: overwrite any existing file.
             with open(self.path, "w", encoding="utf-8") as f:
                 f.write("[\n")
 
     def write(self, df: pd.DataFrame) -> None:
-        records = df.to_dict(orient="records")
         with open(self.path, "a", encoding="utf-8") as f:
-            for rec in records:
+            for rec in df.to_dict(orient="records"):
                 if self._need_comma:
                     f.write(",\n")
                 f.write(json.dumps(rec, default=str))
@@ -142,19 +132,13 @@ def make_writer(fmt: str, path: str, resume: bool):
 
 
 # ---------------------------------------------------------------------------
-# Filter builder
+# Filter helpers
 # ---------------------------------------------------------------------------
 
 def build_filter(predicates: list[str], extra: str) -> dict:
     """
-    Build the FAF API filter param.
-
-    Confirmed working format:
-        filter=field=ge="2025-01-01T00:00:00Z";field=le="2025-10-31T00:00:00Z"
-
-    Operators: =ge= =gt= =le= =lt= == !=
-    AND: ;   OR: ,
-    Extra predicates typed by the user are appended with ;
+    filter=field=ge="2025-01-01T00:00:00Z";field=le="2025-10-31T00:00:00Z"
+    Extra RSQL predicates from the user are appended with ;
     """
     all_parts = list(predicates)
     raw = extra.strip()
@@ -166,8 +150,58 @@ def build_filter(predicates: list[str], extra: str) -> dict:
 
 
 def date_to_filter_value(d: date) -> str:
-    """Return a date as a double-quoted ISO-8601Z string for a filter predicate."""
     return f'"{datetime(d.year, d.month, d.day).strftime("%Y-%m-%dT%H:%M:%SZ")}"'
+
+
+# ---------------------------------------------------------------------------
+# Settings & history persistence
+# ---------------------------------------------------------------------------
+
+def load_settings() -> dict:
+    try:
+        if SETTINGS_FILE.exists():
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_settings(data: dict) -> None:
+    try:
+        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_history() -> list:
+    try:
+        if HISTORY_FILE.exists():
+            return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+
+def append_history(entry: dict) -> None:
+    try:
+        history = load_history()
+        history.insert(0, entry)
+        history = history[:50]   # keep last 50 entries
+        HISTORY_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    else:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}h {m}m"
 
 
 # ---------------------------------------------------------------------------
@@ -181,37 +215,43 @@ class FAFDataApp:
         self.root.resizable(False, False)
 
         self.auth_client = FAFAuthClient(
-            CLIENT_ID,
-            OAUTH_BASE_URL,
-            REDIRECT_URI,
-            SCOPES,
-            TOKEN_FILE,
+            CLIENT_ID, OAUTH_BASE_URL, REDIRECT_URI, SCOPES, TOKEN_FILE,
         )
         self.client = FAFClient(API_BASE_URL, self.auth_client)
         self._stop_event = threading.Event()
+        self._last_output_path: str | None = None
 
         self._build_ui()
+        self._load_settings_to_ui()
 
     # ------------------------------------------------------------------
-    # UI
+    # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
         pad = {"padx": 6, "pady": 3}
-        frame = ttk.Frame(self.root, padding=12)
-        frame.grid(sticky="nsew")
 
+        # Notebook with two tabs: Download and History
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        dl_frame = ttk.Frame(nb, padding=8)
+        hist_frame = ttk.Frame(nb, padding=8)
+        nb.add(dl_frame, text="Download")
+        nb.add(hist_frame, text="History")
+
+        self._build_download_tab(dl_frame, pad)
+        self._build_history_tab(hist_frame)
+
+    def _build_download_tab(self, frame: ttk.Frame, pad: dict) -> None:
         row = 0
 
         # ---- Endpoint ----
         ttk.Label(frame, text="Endpoint").grid(row=row, column=0, sticky="w", **pad)
         self.endpoint_var = tk.StringVar(value="Games")
         ttk.Combobox(
-            frame,
-            textvariable=self.endpoint_var,
-            values=list(ENDPOINTS.keys()),
-            state="readonly",
-            width=28,
+            frame, textvariable=self.endpoint_var,
+            values=list(ENDPOINTS.keys()), state="readonly", width=28,
         ).grid(row=row, column=1, columnspan=2, sticky="ew", **pad)
         row += 1
 
@@ -227,8 +267,8 @@ class FAFDataApp:
         ttk.Entry(frame, textvariable=self.max_pages_var, width=10).grid(row=row, column=1, sticky="w", **pad)
         row += 1
 
-        # ---- Extra filters ----
-        ttk.Label(frame, text='Extra filter (e.g. field=ge="value")').grid(row=row, column=0, sticky="w", **pad)
+        # ---- Extra filter ----
+        ttk.Label(frame, text='Extra filter (RSQL)').grid(row=row, column=0, sticky="w", **pad)
         self.filter_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.filter_var, width=32).grid(row=row, column=1, columnspan=2, sticky="ew", **pad)
         row += 1
@@ -241,81 +281,57 @@ class FAFDataApp:
 
         # ---- Newest first ----
         self.newest_first_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            frame,
-            text="Newest first (sort by -id)",
-            variable=self.newest_first_var,
-        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Checkbutton(frame, text="Newest first (sort by -id)", variable=self.newest_first_var
+                        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
 
-        # ---- Separator ----
-        ttk.Separator(frame, orient="horizontal").grid(
-            row=row, column=0, columnspan=3, sticky="ew", pady=6
-        )
+        ttk.Separator(frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
         row += 1
 
-        # ---- Date range header ----
-        ttk.Label(frame, text="Date range filter (field auto-detected per endpoint)", font=("", 9, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky="w", padx=6
-        )
+        # ---- Date range ----
+        ttk.Label(frame, text="Date range (auto-detected field per endpoint)", font=("", 9, "bold")
+                  ).grid(row=row, column=0, columnspan=3, sticky="w", padx=6)
         row += 1
 
-        # ---- Date from ----
         ttk.Label(frame, text="Date from").grid(row=row, column=0, sticky="w", **pad)
-        self.date_from = DateEntry(
-            frame, width=14, date_pattern="yyyy-mm-dd",
-            background="darkblue", foreground="white",
-        )
+        self.date_from = DateEntry(frame, width=14, date_pattern="yyyy-mm-dd",
+                                   background="darkblue", foreground="white")
         self.date_from.delete(0, "end")
         self.date_from.grid(row=row, column=1, sticky="w", **pad)
         self._date_from_active = False
         self.date_from.bind("<<DateEntrySelected>>", lambda e: setattr(self, "_date_from_active", True))
-        ttk.Button(frame, text="Clear", width=5,
-                   command=self._clear_date_from).grid(row=row, column=2, **pad)
+        ttk.Button(frame, text="Clear", width=5, command=self._clear_date_from
+                   ).grid(row=row, column=2, **pad)
         row += 1
 
-        # ---- Date to ----
         ttk.Label(frame, text="Date to").grid(row=row, column=0, sticky="w", **pad)
-        self.date_to = DateEntry(
-            frame, width=14, date_pattern="yyyy-mm-dd",
-            background="darkblue", foreground="white",
-        )
+        self.date_to = DateEntry(frame, width=14, date_pattern="yyyy-mm-dd",
+                                 background="darkblue", foreground="white")
         self.date_to.delete(0, "end")
         self.date_to.grid(row=row, column=1, sticky="w", **pad)
         self._date_to_active = False
         self.date_to.bind("<<DateEntrySelected>>", lambda e: setattr(self, "_date_to_active", True))
-        ttk.Button(frame, text="Clear", width=5,
-                   command=self._clear_date_to).grid(row=row, column=2, **pad)
+        ttk.Button(frame, text="Clear", width=5, command=self._clear_date_to
+                   ).grid(row=row, column=2, **pad)
         row += 1
 
-        # ---- Download all in range checkbox ----
         self.all_in_range_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frame,
-            text="Download ALL records in date range (ignores Max pages)",
-            variable=self.all_in_range_var,
-        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Checkbutton(frame, text="Download ALL records in date range (ignores Max pages)",
+                        variable=self.all_in_range_var
+                        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
 
-        # ---- Separator ----
-        ttk.Separator(frame, orient="horizontal").grid(
-            row=row, column=0, columnspan=3, sticky="ew", pady=6
-        )
+        ttk.Separator(frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
         row += 1
 
         # ---- Export format ----
         ttk.Label(frame, text="Export format").grid(row=row, column=0, sticky="w", **pad)
         self.format_var = tk.StringVar(value="csv")
-        ttk.Combobox(
-            frame,
-            textvariable=self.format_var,
-            values=["csv", "parquet", "json"],
-            state="readonly",
-            width=12,
-        ).grid(row=row, column=1, sticky="w", **pad)
+        ttk.Combobox(frame, textvariable=self.format_var, values=["csv", "parquet", "json"],
+                     state="readonly", width=12).grid(row=row, column=1, sticky="w", **pad)
         row += 1
 
-        # ---- Chunk size ----
+        # ---- Chunk pages ----
         ttk.Label(frame, text="Pages per chunk").grid(row=row, column=0, sticky="w", **pad)
         self.chunk_size_var = tk.StringVar(value=str(DEFAULT_CHUNK_PAGES))
         ttk.Entry(frame, textvariable=self.chunk_size_var, width=10).grid(row=row, column=1, sticky="w", **pad)
@@ -323,23 +339,22 @@ class FAFDataApp:
 
         # ---- Resume ----
         self.resume_var = tk.BooleanVar()
-        ttk.Checkbutton(
-            frame,
-            text="Resume previous download",
-            variable=self.resume_var,
-        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Checkbutton(frame, text="Resume previous download", variable=self.resume_var
+                        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
 
-        # ---- Progress bar ----
-        self.progress = ttk.Progressbar(frame, mode="indeterminate", length=360)
+        ttk.Separator(frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        row += 1
+
+        # ---- Progress bar (determinate) ----
+        self.progress = ttk.Progressbar(frame, mode="determinate", length=380, maximum=100)
         self.progress.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
         row += 1
 
         # ---- Status label ----
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(frame, textvariable=self.status_var, foreground="gray").grid(
-            row=row, column=0, columnspan=3, sticky="w", **pad
-        )
+        ttk.Label(frame, textvariable=self.status_var, foreground="gray", wraplength=380
+                  ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
         row += 1
 
         # ---- Buttons ----
@@ -352,7 +367,101 @@ class FAFDataApp:
         self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self._stop_download, state="disabled")
         self.stop_btn.pack(side="left", padx=4)
 
+        self.open_btn = ttk.Button(btn_frame, text="Open output folder", command=self._open_output_file, state="disabled")
+        self.open_btn.pack(side="left", padx=4)
+
+
+
         frame.columnconfigure(1, weight=1)
+
+    def _build_history_tab(self, frame: ttk.Frame) -> None:
+        cols = ("time", "endpoint", "records", "duration", "file")
+        self.history_tree = ttk.Treeview(frame, columns=cols, show="headings", height=14)
+        self.history_tree.heading("time",     text="Time")
+        self.history_tree.heading("endpoint", text="Endpoint")
+        self.history_tree.heading("records",  text="Records")
+        self.history_tree.heading("duration", text="Duration")
+        self.history_tree.heading("file",     text="Output file")
+
+        self.history_tree.column("time",     width=130, anchor="w")
+        self.history_tree.column("endpoint", width=120, anchor="w")
+        self.history_tree.column("records",  width=80,  anchor="e")
+        self.history_tree.column("duration", width=70,  anchor="e")
+        self.history_tree.column("file",     width=250, anchor="w")
+
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=sb.set)
+        self.history_tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        self.history_tree.bind("<Double-1>", self._on_history_double_click)
+        self._refresh_history_view()
+
+    # ------------------------------------------------------------------
+    # Settings persistence
+    # ------------------------------------------------------------------
+
+    def _load_settings_to_ui(self) -> None:
+        s = load_settings()
+        if not s:
+            return
+        if "endpoint" in s:
+            self.endpoint_var.set(s["endpoint"])
+        if "page_size" in s:
+            self.page_size_var.set(str(s["page_size"]))
+        if "max_pages" in s:
+            self.max_pages_var.set(str(s["max_pages"]))
+        if "filter" in s:
+            self.filter_var.set(s["filter"])
+        if "include" in s:
+            self.include_var.set(s["include"])
+        if "newest_first" in s:
+            self.newest_first_var.set(bool(s["newest_first"]))
+        if "format" in s:
+            self.format_var.set(s["format"])
+        if "chunk_pages" in s:
+            self.chunk_size_var.set(str(s["chunk_pages"]))
+        if "all_in_range" in s:
+            self.all_in_range_var.set(bool(s["all_in_range"]))
+
+    def _save_settings_from_ui(self) -> None:
+        save_settings({
+            "endpoint":    self.endpoint_var.get(),
+            "page_size":   self.page_size_var.get(),
+            "max_pages":   self.max_pages_var.get(),
+            "filter":      self.filter_var.get(),
+            "include":     self.include_var.get(),
+            "newest_first": self.newest_first_var.get(),
+            "format":      self.format_var.get(),
+            "chunk_pages": self.chunk_size_var.get(),
+            "all_in_range": self.all_in_range_var.get(),
+        })
+
+    # ------------------------------------------------------------------
+    # History
+    # ------------------------------------------------------------------
+
+    def _refresh_history_view(self) -> None:
+        for item in self.history_tree.get_children():
+            self.history_tree.delete(item)
+        for entry in load_history():
+            self.history_tree.insert("", "end", values=(
+                entry.get("time", ""),
+                entry.get("endpoint", ""),
+                f"{entry.get('records', 0):,}",
+                entry.get("duration", ""),
+                entry.get("file", ""),
+            ))
+
+    def _on_history_double_click(self, event) -> None:
+        """Double-clicking a history row opens that file in Explorer/Finder."""
+        sel = self.history_tree.selection()
+        if not sel:
+            return
+        values = self.history_tree.item(sel[0], "values")
+        if values:
+            path = values[4]  # file column
+            self._reveal_path(path)
 
     # ------------------------------------------------------------------
     # Date helpers
@@ -367,7 +476,6 @@ class FAFDataApp:
         self._date_to_active = False
 
     def _get_selected_date(self, entry: DateEntry, active_attr: str) -> date | None:
-        """Return a date object if the user has picked a date, else None."""
         if not getattr(self, active_attr):
             return None
         raw = entry.get().strip()
@@ -379,6 +487,32 @@ class FAFDataApp:
             return None
 
     # ------------------------------------------------------------------
+    # File / folder opening
+    # ------------------------------------------------------------------
+
+    def _open_output_file(self) -> None:
+        # With chunked output there's no single file — open the folder instead.
+        if self._last_output_path and os.path.exists(self._last_output_path):
+            self._reveal_path(self._last_output_path)
+
+    def _open_output_folder(self) -> None:
+        if self._last_output_path and os.path.exists(self._last_output_path):
+            self._reveal_path(self._last_output_path)
+
+    @staticmethod
+    def _reveal_path(path: str) -> None:
+        """Open a file or folder in the OS file manager."""
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            logger.warning("Could not open path %s: %s", path, e)
+
+    # ------------------------------------------------------------------
     # Download orchestration
     # ------------------------------------------------------------------
 
@@ -386,8 +520,10 @@ class FAFDataApp:
         self._stop_event.clear()
         self.download_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.progress.start(12)
+        self.open_btn.configure(state="disabled")
+        self.progress["value"] = 0
         self.status_var.set("Starting download…")
+        self._save_settings_from_ui()
         thread = threading.Thread(target=self._download, daemon=True)
         thread.start()
 
@@ -395,43 +531,61 @@ class FAFDataApp:
         self._stop_event.set()
         self.status_var.set("Stopping after current page…")
 
-    def _finish_ui(self, msg: str, error: bool = False) -> None:
-        self.progress.stop()
+    def _finish_ui(self, msg: str, error: bool = False, output_path: str | None = None) -> None:
         self.progress["value"] = 0
         self.download_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.status_var.set(msg)
+        if output_path and os.path.exists(output_path):
+            self._last_output_path = output_path
+            self.open_btn.configure(state="normal")
         if error:
             messagebox.showerror("Error", msg)
+
+    def _update_progress(self, fetched: int, total: int | None, rate: float, elapsed: float) -> None:
+        """Update the progress bar and status label from the main thread."""
+        if total and total > 0:
+            pct = min(100.0, fetched / total * 100)
+            self.progress["value"] = pct
+            remaining = ((total - fetched) / rate) if rate > 0 else 0
+            eta_str = format_duration(remaining) if rate > 0 else "…"
+            self.status_var.set(
+                f"{fetched:,} / {total:,} records ({pct:.1f}%) — "
+                f"{rate:.0f} rec/s — ETA {eta_str}"
+            )
+        else:
+            # Total unknown — show indeterminate-style text, pulse bar
+            self.progress["value"] = (self.progress["value"] + 2) % 100
+            rate_str = f"{rate:.0f} rec/s" if rate > 0 else "…"
+            self.status_var.set(
+                f"{fetched:,} records fetched — {rate_str} — {format_duration(elapsed)} elapsed"
+            )
 
     # ------------------------------------------------------------------
 
     def _download(self) -> None:
+        start_time = time.monotonic()
+        total_records = 0
+
         try:
             endpoint_name = self.endpoint_var.get()
-            endpoint = ENDPOINTS[endpoint_name]
-            page_size = min(int(self.page_size_var.get()), API_MAX_PAGE_SIZE)
-            chunk_pages = max(1, int(self.chunk_size_var.get()))
-            fmt = self.format_var.get()
-            all_in_range = self.all_in_range_var.get()
+            endpoint      = ENDPOINTS[endpoint_name]
+            page_size     = min(int(self.page_size_var.get()), API_MAX_PAGE_SIZE)
+            chunk_pages   = max(1, int(self.chunk_size_var.get()))
+            fmt           = self.format_var.get()
+            all_in_range  = self.all_in_range_var.get()
 
             max_pages_raw = int(self.max_pages_var.get())
             max_pages = None if (all_in_range or max_pages_raw == 0) else max_pages_raw
 
-            # ------------------------------------------------------------------
             # Build params
-            # ------------------------------------------------------------------
             params: dict = {"page[size]": page_size}
-
             if self.include_var.get().strip():
                 params["include"] = self.include_var.get()
-
             if self.newest_first_var.get():
                 params["sort"] = "-id"
 
-            # Build Elide RSQL filter params.
-            # Format: filter[entityType]=field=ge='value';field=lt='value'
-            _, entity_type, date_field = ENDPOINT_META[endpoint_name]
+            _, _entity_type, date_field = ENDPOINT_META[endpoint_name]
             date_from = self._get_selected_date(self.date_from, "_date_from_active")
             date_to   = self._get_selected_date(self.date_to,   "_date_to_active")
 
@@ -439,34 +593,28 @@ class FAFDataApp:
             if date_field and date_from:
                 filter_predicates.append(f"{date_field}=ge={date_to_filter_value(date_from)}")
             if date_field and date_to:
-                # =le= at 23:59:59 so the entire chosen end date is included.
                 end_val = f'"{datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59).strftime("%Y-%m-%dT%H:%M:%SZ")}"'
                 filter_predicates.append(f"{date_field}=le={end_val}")
 
-            filter_params = build_filter(filter_predicates, self.filter_var.get())
-            params.update(filter_params)
+            params.update(build_filter(filter_predicates, self.filter_var.get()))
 
             if all_in_range and not filter_predicates:
                 self.root.after(0, lambda: self._finish_ui(
-                    "Error: 'Download all in range' requires at least one date.", error=True
-                ))
+                    "Error: 'Download all in range' requires at least one date.", error=True))
                 return
 
-            # ------------------------------------------------------------------
             # Resume handling
-            # ------------------------------------------------------------------
-            start_page = 1
+            start_page  = 1
             output_path = None
-            resuming = False
+            resuming    = False
 
             if self.resume_var.get() and CHUNK_STATE_FILE.exists():
                 state = json.loads(CHUNK_STATE_FILE.read_text())
-                start_page = state.get("next_page", 1)
+                start_page  = state.get("next_page", 1)
                 output_path = state.get("output_path")
-                resuming = bool(output_path and os.path.exists(output_path))
+                resuming    = bool(output_path and os.path.exists(output_path))
                 self.root.after(0, lambda pg=state.get("page_count", "?"): self.status_var.set(
-                    f"Resuming from page {pg}…"
-                ))
+                    f"Resuming from page {pg}…"))
 
             if not output_path:
                 output_path = self._ask_save_path(fmt)
@@ -474,20 +622,41 @@ class FAFDataApp:
                     self.root.after(0, lambda: self._finish_ui("Cancelled."))
                     return
 
-            # resuming=False → writers will overwrite any existing file
-            writer = make_writer(fmt, output_path, resume=resuming)
+            # Chunked output: each chunk_pages pages → a separate numbered file.
+            # e.g. output.csv → output_001.csv, output_002.csv, ...
+            out_path  = Path(output_path)
+            out_stem  = out_path.stem
+            out_suffix = out_path.suffix
+            out_dir   = out_path.parent
 
-            # ------------------------------------------------------------------
-            # Streaming download loop
-            # ------------------------------------------------------------------
             page_buffer: list = []
-            total_records = 0
             chunk_record_threshold = chunk_pages * page_size
+            chunk_index = (start_page - 1) // chunk_pages  # resume-aware chunk numbering
 
-            def progress_callback(page: int, api_total: int) -> None:
-                self.root.after(0, lambda p=page, r=api_total: self.status_var.set(
-                    f"Fetching… page {p+1} | {r:,} records received so far"
-                ))
+            def next_chunk_path(idx: int) -> str:
+                return str(out_dir / f"{out_stem}_{idx + 1:03d}{out_suffix}")
+
+            current_writer = make_writer(fmt, next_chunk_path(chunk_index), resume=resuming)
+
+            # ── Pre-download record count probe ──────────────────────────
+            # Always probe with the full params (including any filters) so we
+            # get the count for the actual filtered result set, not the global
+            # total.  This is cheap — it fetches only 1 record.
+            self.root.after(0, lambda: self.status_var.set("Counting records…"))
+            api_total: int | None = self.client.count_records(endpoint, params)
+            if api_total is not None:
+                logger.info("Pre-download count: %s records", api_total)
+                self.root.after(0, lambda t=api_total: self.status_var.set(
+                    f"{t:,} records to download — starting…"))
+
+            def progress_callback(page: int, fetched: int, reported_total: int | None) -> None:
+                # Use the pre-probed total; ignore reported_total from iter_pages
+                # because it comes from the first data page's meta, which on some
+                # endpoints ignores filters and returns the global count.
+                elapsed = time.monotonic() - start_time
+                rate    = fetched / elapsed if elapsed > 0 else 0
+                self.root.after(0, lambda f=fetched, t=api_total, r=rate, e=elapsed:
+                                self._update_progress(f, t, r, e))
 
             try:
                 for page_records in self.client.iter_pages(
@@ -503,30 +672,51 @@ class FAFDataApp:
                         break
 
                     page_buffer.extend(page_records)
-
                     if len(page_buffer) >= chunk_record_threshold:
-                        self._flush_chunk(writer, page_buffer)
+                        self._flush_chunk(current_writer, page_buffer)
                         total_records += len(page_buffer)
                         page_buffer.clear()
+                        current_writer.close()
+                        chunk_index += 1
+                        current_writer = make_writer(fmt, next_chunk_path(chunk_index), resume=False)
 
-                # Flush remainder
+                # Flush any remaining records into the current (last) chunk
                 if page_buffer:
-                    self._flush_chunk(writer, page_buffer)
+                    self._flush_chunk(current_writer, page_buffer)
                     total_records += len(page_buffer)
                     page_buffer.clear()
 
             finally:
-                writer.close()
+                current_writer.close()
 
             if not self._stop_event.is_set() and CHUNK_STATE_FILE.exists():
                 CHUNK_STATE_FILE.unlink()
 
-            if self._stop_event.is_set():
-                msg = f"Stopped. {total_records:,} records saved to {output_path}. Resume to continue."
-            else:
-                msg = f"Done. {total_records:,} records saved to {output_path}"
+            elapsed   = time.monotonic() - start_time
+            duration  = format_duration(elapsed)
 
-            self.root.after(0, lambda m=msg: self._finish_ui(m))
+            if self._stop_event.is_set():
+                msg = f"Stopped. {total_records:,} records saved — {duration}. Resume to continue."
+            else:
+                msg = f"Done. {total_records:,} records saved — {duration}."
+
+            # Log to history — record the folder and file pattern
+            chunk_pattern = str(out_dir / f"{out_stem}_*{out_suffix}")
+            append_history({
+                "time":     datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "endpoint": endpoint_name,
+                "records":  total_records,
+                "duration": duration,
+                "file":     chunk_pattern,
+            })
+
+            # Open-file buttons point to the output folder (multiple chunk files)
+            folder = str(out_dir)
+            self.root.after(0, lambda m=msg, p=folder: (
+                self._finish_ui(m, output_path=p),
+                self.progress.configure(value=100 if not self._stop_event.is_set() else self.progress["value"]),
+                self._refresh_history_view(),
+            ))
 
         except Exception as exc:
             logger.exception("Download failed")
@@ -544,17 +734,15 @@ class FAFDataApp:
     def _ask_save_path(self, fmt: str) -> str | None:
         filetypes = {
             "parquet": [("Parquet files", "*.parquet")],
-            "csv": [("CSV files", "*.csv")],
-            "json": [("JSON files", "*.json")],
+            "csv":     [("CSV files",     "*.csv")],
+            "json":    [("JSON files",    "*.json")],
         }
         result: list = []
         evt = threading.Event()
 
         def ask():
             path = filedialog.asksaveasfilename(
-                defaultextension=f".{fmt}",
-                filetypes=filetypes[fmt],
-            )
+                defaultextension=f".{fmt}", filetypes=filetypes[fmt])
             result.append(path or None)
             evt.set()
 

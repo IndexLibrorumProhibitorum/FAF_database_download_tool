@@ -2,7 +2,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -26,7 +26,7 @@ class FAFClient:
         self._apply_auth_header()
 
     # ------------------------------------------------------------------
-    # Public API – streaming (yields one page of records at a time)
+    # Public API
     # ------------------------------------------------------------------
 
     def iter_pages(
@@ -35,20 +35,23 @@ class FAFClient:
         params: Optional[Dict[str, Any]] = None,
         max_pages: Optional[int] = None,
         start_page: int = 1,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
+        progress_callback: Optional[Callable[[int, int, Optional[int]], None]] = None,
         resume_file: Optional[Path] = None,
         resume_extra: Optional[Dict[str, Any]] = None,
     ) -> Iterator[List[Dict[str, Any]]]:
         """Yield one page of raw JSON-API records at a time.
 
-        Pagination is done by incrementing page[number] manually — the FAF API
-        next_link approach proved unreliable. Stops when a page returns 0 records.
+        Pagination is done by manually incrementing page[number].
+        Stops when a page returns 0 records.
 
-        progress_callback receives (page_count, total_records_fetched_so_far).
+        progress_callback(page_count, records_so_far, total_records_or_None)
+          total_records is read from meta.page.totalRecords on the first page;
+          None if the API doesn't provide it.
         """
         params = dict(params or {})
         page_count = 0
-        total_records = 0
+        total_fetched = 0
+        total_records: Optional[int] = None
         page_number = start_page
 
         base_url = urljoin(self.api_base_url, endpoint.lstrip("/"))
@@ -61,16 +64,23 @@ class FAFClient:
             payload = response.json()
             records = payload.get("data", [])
 
-            # Stop when the server returns an empty page — that's the end.
             if not records:
                 logger.info("Empty page received, download complete.")
                 break
 
-            total_records += len(records)
+            # Extract total record count from meta on first page
+            if total_records is None:
+                try:
+                    total_records = int(payload["meta"]["page"]["totalRecords"])
+                    logger.info("Total records reported by API: %s", total_records)
+                except (KeyError, TypeError, ValueError):
+                    total_records = None
+
+            total_fetched += len(records)
             page_count += 1
 
             if progress_callback:
-                progress_callback(page_count, total_records)
+                progress_callback(page_count, total_fetched, total_records)
 
             yield records
 
@@ -86,7 +96,6 @@ class FAFClient:
 
             page_number += 1
 
-        # Clean up resume file when all pages are exhausted naturally
         if resume_file and resume_file.exists() and not (max_pages and page_count >= max_pages):
             resume_file.unlink()
 
@@ -96,11 +105,10 @@ class FAFClient:
         params: Optional[Dict[str, Any]] = None,
         max_pages: Optional[int] = None,
         start_page: int = 1,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
+        progress_callback: Optional[Callable[[int, int, Optional[int]], None]] = None,
         resume_file: Optional[Path] = None,
         resume_extra: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Convenience wrapper that collects all pages into a list."""
         collected: List[Dict[str, Any]] = []
         for page in self.iter_pages(
             endpoint,
@@ -114,22 +122,37 @@ class FAFClient:
             collected.extend(page)
         return collected
 
+    def count_records(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """
+        Return the total number of records matching params by making a single
+        cheap probe request with page[size]=1 and reading meta.page.totalRecords.
+        Returns None if the API doesn't provide the count.
+        """
+        probe_params = dict(params or {})
+        probe_params["page[size]"] = 1
+        probe_params["page[number]"] = 1
+
+        base_url = urljoin(self.api_base_url, endpoint.lstrip("/"))
+        try:
+            response = self._request_with_retry("GET", base_url, params=probe_params)
+            payload  = response.json()
+            return int(payload["meta"]["page"]["totalRecords"])
+        except (KeyError, TypeError, ValueError, Exception) as e:
+            logger.warning("count_records probe failed: %s", e)
+            return None
+
     # ------------------------------------------------------------------
     # Internal Helpers
     # ------------------------------------------------------------------
 
-    def _request_with_retry(
-        self,
-        method: str,
-        url: str,
-        **kwargs: Any,
-    ) -> requests.Response:
+    def _request_with_retry(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         max_retries = 5
-
         for attempt in range(max_retries):
-            response = self.session.request(
-                method, url, timeout=self.timeout, **kwargs,
-            )
+            response = self.session.request(method, url, timeout=self.timeout, **kwargs)
 
             if response.status_code == 429:
                 wait = 2 ** attempt
@@ -149,15 +172,11 @@ class FAFClient:
 
     def _apply_auth_header(self) -> None:
         token_data = self.auth_client.get_token()
-        self.session.headers.update(
-            {"Authorization": f"Bearer {token_data['access_token']}"}
-        )
+        self.session.headers.update({"Authorization": f"Bearer {token_data['access_token']}"})
 
     def _refresh_auth(self) -> None:
         token_data = self.auth_client.get_token()
-        self.session.headers.update(
-            {"Authorization": f"Bearer {token_data['access_token']}"}
-        )
+        self.session.headers.update({"Authorization": f"Bearer {token_data['access_token']}"})
 
     @staticmethod
     def _save_resume_state(
