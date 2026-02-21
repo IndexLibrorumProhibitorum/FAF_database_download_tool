@@ -1,0 +1,4 @@
+requests~=2.32.5
+tkcalendar~=1.6.1
+pandas~=3.0.1
+pyarrow~=23.0.1

@@ -1,6 +1,6 @@
 import json
 
-from data.faf_data_download_tool.config import SETTINGS_FILE, HISTORY_FILE
+from config import SETTINGS_FILE, HISTORY_FILE
 
 
 def load_settings() -> dict:

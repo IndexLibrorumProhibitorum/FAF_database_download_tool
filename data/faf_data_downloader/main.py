@@ -13,8 +13,8 @@ from tkcalendar import DateEntry   # pip install tkcalendar
 from auth import FAFAuthClient
 from client import FAFClient
 from config import *
-from data.faf_data_download_tool.utils_filters import build_filter, date_to_filter_value
-from data.faf_data_download_tool.utils_history import load_settings, save_settings, load_history, append_history, \
+from utils_filters import build_filter, date_to_filter_value
+from utils_history import load_settings, save_settings, load_history, append_history, \
     format_duration
 from utils_dataframe import jsonapi_to_dataframe, convert_datetime_columns
 from utils_filewriters import make_writer

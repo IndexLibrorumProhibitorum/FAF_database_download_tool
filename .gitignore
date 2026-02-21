@@ -1,4 +1,4 @@
 /data/exports/
-/data/faf_data_download_tool/token.json
-/data/faf_data_download_tool/download_history.json
-/data/faf_data_download_tool/settings.json
+/data/faf_data_downloader/token.json
+/data/faf_data_downloader/download_history.json
+/data/faf_data_downloader/settings.json
