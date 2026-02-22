@@ -24,6 +24,9 @@ def jsonapi_to_dataframe(
         # Attributes
         attributes = item.get("attributes", {})
         for key, value in attributes.items():
+            if key == "email":
+                continue
+
             row[key] = value
 
         # Relationships
