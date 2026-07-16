@@ -1,11 +1,12 @@
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
 import threading
-from datetime import datetime, date
+from datetime import datetime, date, time as datetime_time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkcalendar import DateEntry   # pip install tkcalendar
@@ -15,6 +16,7 @@ from client import FAFClient
 from config import *
 from utils_filters import build_filter, date_to_filter_value
 from utils_history import load_settings, save_settings, load_history, append_history, \
+    load_rating_history, append_rating_history, clear_rating_history, prune_rating_history, \
     format_duration
 from utils_dataframe import jsonapi_to_dataframe, convert_datetime_columns
 from utils_filewriters import make_writer
@@ -34,7 +36,8 @@ class FAFDataApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("FAF Data Downloader")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
+        self.root.minsize(760, 600)
 
         self.auth_client = FAFAuthClient(
             CLIENT_ID, OAUTH_BASE_URL, REDIRECT_URI, SCOPES, TOKEN_FILE,
@@ -53,17 +56,20 @@ class FAFDataApp:
     def _build_ui(self) -> None:
         pad = {"padx": 6, "pady": 3}
 
-        # Notebook with two tabs: Download and History
+        # Notebook with three tabs: Download, History and Rating Lookup
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
 
         dl_frame = ttk.Frame(nb, padding=8)
         hist_frame = ttk.Frame(nb, padding=8)
+        rating_frame = ttk.Frame(nb, padding=8)
         nb.add(dl_frame, text="Download")
         nb.add(hist_frame, text="History")
+        nb.add(rating_frame, text="Rating lookup")
 
         self._build_download_tab(dl_frame, pad)
         self._build_history_tab(hist_frame)
+        self._build_rating_lookup_tab(rating_frame, pad)
 
     def _build_download_tab(self, frame: ttk.Frame, pad: dict) -> None:
         row = 0
@@ -217,6 +223,93 @@ class FAFDataApp:
         self.history_tree.bind("<Double-1>", self._on_history_double_click)
         self._refresh_history_view()
 
+    def _build_rating_lookup_tab(self, frame: ttk.Frame, pad: dict) -> None:
+        row = 0
+
+        ttk.Label(frame, text="Usernames").grid(row=row, column=0, sticky="w", **pad)
+        self.rating_username_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.rating_username_var, width=32).grid(
+            row=row, column=1, columnspan=2, sticky="ew", **pad)
+        row += 1
+
+        ttk.Label(frame, text="Date").grid(row=row, column=0, sticky="w", **pad)
+        self.rating_date = DateEntry(frame, width=14, date_pattern="yyyy-mm-dd",
+                                     background="darkblue", foreground="white")
+        self.rating_date.grid(row=row, column=1, sticky="w", **pad)
+        ttk.Button(frame, text="Today", width=7, command=self._set_rating_date_today).grid(
+            row=row, column=2, sticky="w", **pad)
+        row += 1
+
+        ttk.Label(frame, text="Leaderboard").grid(row=row, column=0, sticky="w", **pad)
+        self.rating_leaderboard_var = tk.StringVar(value="global")
+        ttk.Combobox(
+            frame,
+            textvariable=self.rating_leaderboard_var,
+            values=["global", "ladder1v1"],
+            state="readonly",
+            width=14,
+        ).grid(row=row, column=1, sticky="w", **pad)
+        row += 1
+
+        self.rating_compact_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="Compact results", variable=self.rating_compact_var).grid(
+            row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        self.rating_lookup_btn = ttk.Button(frame, text="Get rating", command=self._start_rating_lookup)
+        self.rating_lookup_btn.grid(row=row, column=0, columnspan=3, pady=(8, 4))
+        row += 1
+
+        self.rating_status_var = tk.StringVar(value="Enter one or more usernames and a date.")
+        ttk.Label(frame, textvariable=self.rating_status_var, foreground="gray", wraplength=380).grid(
+            row=row, column=0, columnspan=3, sticky="w", **pad)
+        row += 1
+
+        result_row = row
+        self.rating_result = tk.Text(frame, width=100, height=10, wrap="none", state="disabled")
+        self.rating_result.grid(row=row, column=0, columnspan=3, sticky="nsew", padx=6, pady=(6, 0))
+        row += 1
+
+        ttk.Separator(frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
+        row += 1
+
+        ttk.Label(frame, text="Lookup history").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Label(frame, text="Keep days").grid(row=row, column=1, sticky="e", **pad)
+        self.rating_history_days_var = tk.StringVar(value="30")
+        ttk.Spinbox(frame, from_=0, to=3650, width=6, textvariable=self.rating_history_days_var).grid(
+            row=row, column=2, sticky="w", **pad)
+        row += 1
+
+        history_buttons = ttk.Frame(frame)
+        history_buttons.grid(row=row, column=0, columnspan=3, sticky="w", padx=6, pady=3)
+        ttk.Button(history_buttons, text="Clean old", command=self._clean_old_rating_history).pack(side="left", padx=(0, 4))
+        ttk.Button(history_buttons, text="Clear history", command=self._clear_rating_history).pack(side="left")
+        row += 1
+
+        rating_cols = ("time", "usernames", "date", "leaderboard", "rating", "games", "found")
+        self.rating_history_tree = ttk.Treeview(frame, columns=rating_cols, show="headings", height=6)
+        self.rating_history_tree.heading("time", text="Time")
+        self.rating_history_tree.heading("usernames", text="Usernames")
+        self.rating_history_tree.heading("date", text="Date")
+        self.rating_history_tree.heading("leaderboard", text="Board")
+        self.rating_history_tree.heading("rating", text="Rating")
+        self.rating_history_tree.heading("games", text="Games")
+        self.rating_history_tree.heading("found", text="Found")
+        self.rating_history_tree.column("time", width=115, anchor="w")
+        self.rating_history_tree.column("usernames", width=145, anchor="w")
+        self.rating_history_tree.column("date", width=80, anchor="w")
+        self.rating_history_tree.column("leaderboard", width=70, anchor="w")
+        self.rating_history_tree.column("rating", width=85, anchor="w")
+        self.rating_history_tree.column("games", width=70, anchor="w")
+        self.rating_history_tree.column("found", width=55, anchor="e")
+        history_row = row
+        self.rating_history_tree.grid(row=row, column=0, columnspan=3, sticky="nsew", padx=6, pady=(3, 0))
+        self.rating_history_tree.bind("<Double-1>", self._on_rating_history_double_click)
+
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(result_row, weight=2)
+        frame.rowconfigure(history_row, weight=1)
+
     # ------------------------------------------------------------------
     # Settings persistence
     # ------------------------------------------------------------------
@@ -224,6 +317,7 @@ class FAFDataApp:
     def _load_settings_to_ui(self) -> None:
         s = load_settings()
         if not s:
+            self._refresh_rating_history_view()
             return
         if "endpoint" in s:
             self.endpoint_var.set(s["endpoint"])
@@ -243,6 +337,21 @@ class FAFDataApp:
             self.chunk_size_var.set(str(s["chunk_pages"]))
         if "all_in_range" in s:
             self.all_in_range_var.set(bool(s["all_in_range"]))
+        if "rating_usernames" in s:
+            self.rating_username_var.set(s["rating_usernames"])
+        if "rating_date" in s:
+            try:
+                self.rating_date.set_date(datetime.strptime(s["rating_date"], "%Y-%m-%d").date())
+            except (TypeError, ValueError):
+                pass
+        if "rating_leaderboard" in s:
+            self.rating_leaderboard_var.set(s["rating_leaderboard"])
+        if "rating_compact" in s:
+            self.rating_compact_var.set(bool(s["rating_compact"]))
+        if "rating_history_days" in s:
+            self.rating_history_days_var.set(str(s["rating_history_days"]))
+        self._clean_old_rating_history(show_message=False)
+        self._refresh_rating_history_view()
 
     def _save_settings_from_ui(self) -> None:
         save_settings({
@@ -255,6 +364,11 @@ class FAFDataApp:
             "format":      self.format_var.get(),
             "chunk_pages": self.chunk_size_var.get(),
             "all_in_range": self.all_in_range_var.get(),
+            "rating_usernames": self.rating_username_var.get(),
+            "rating_date": self.rating_date.get(),
+            "rating_leaderboard": self.rating_leaderboard_var.get(),
+            "rating_compact": self.rating_compact_var.get(),
+            "rating_history_days": self.rating_history_days_var.get(),
         })
 
     # ------------------------------------------------------------------
@@ -283,6 +397,61 @@ class FAFDataApp:
             path = values[4]  # file column
             self._reveal_path(path)
 
+    def _refresh_rating_history_view(self) -> None:
+        for item in self.rating_history_tree.get_children():
+            self.rating_history_tree.delete(item)
+        for index, entry in enumerate(load_rating_history()):
+            self.rating_history_tree.insert("", "end", iid=str(index), values=(
+                entry.get("time", ""),
+                entry.get("usernames", ""),
+                entry.get("date", ""),
+                entry.get("leaderboard", ""),
+                entry.get("rating", ""),
+                entry.get("games", ""),
+                f"{entry.get('found', 0)}/{entry.get('total', 0)}",
+            ))
+
+    def _on_rating_history_double_click(self, event) -> None:
+        sel = self.rating_history_tree.selection()
+        if not sel:
+            return
+        try:
+            entry = load_rating_history()[int(sel[0])]
+        except (IndexError, ValueError):
+            return
+
+        self.rating_username_var.set(entry.get("usernames", ""))
+        if entry.get("date"):
+            try:
+                self.rating_date.set_date(datetime.strptime(entry["date"], "%Y-%m-%d").date())
+            except ValueError:
+                pass
+        if entry.get("leaderboard"):
+            self.rating_leaderboard_var.set(entry["leaderboard"])
+
+    def _rating_history_days(self) -> int:
+        try:
+            return max(0, int(self.rating_history_days_var.get()))
+        except ValueError:
+            return 0
+
+    def _clean_old_rating_history(self, show_message: bool = True) -> None:
+        days = self._rating_history_days()
+        prune_rating_history(days)
+        self._refresh_rating_history_view()
+        if show_message:
+            self.rating_status_var.set(
+                f"Removed rating lookup history older than {days} day(s)." if days > 0
+                else "Automatic history cleanup is disabled."
+            )
+
+    def _clear_rating_history(self) -> None:
+        if not messagebox.askyesno("Clear history", "Clear all rating lookup history?"):
+            return
+        clear_rating_history()
+        self._refresh_rating_history_view()
+        self.rating_status_var.set("Rating lookup history cleared.")
+
     # ------------------------------------------------------------------
     # Date helpers
     # ------------------------------------------------------------------
@@ -305,6 +474,289 @@ class FAFDataApp:
             return datetime.strptime(raw, "%Y-%m-%d").date()
         except ValueError:
             return None
+
+    @staticmethod
+    def _rsql_quote(value: str) -> str:
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    @staticmethod
+    def _jsonapi_attrs(record: dict) -> dict:
+        attrs = dict(record.get("attributes") or {})
+        attrs["id"] = record.get("id")
+        return attrs
+
+    @staticmethod
+    def _relationship_id(record: dict, name: str) -> str | None:
+        rel_data = ((record.get("relationships") or {}).get(name) or {}).get("data")
+        if isinstance(rel_data, dict):
+            return rel_data.get("id")
+        return None
+
+    @staticmethod
+    def _included_by_type_and_id(payload: dict) -> dict[tuple[str, str], dict]:
+        included = {}
+        for item in payload.get("included", []) or []:
+            item_type = item.get("type")
+            item_id = item.get("id")
+            if item_type and item_id:
+                included[(item_type, item_id)] = item
+        return included
+
+    def _set_rating_result(self, text: str) -> None:
+        self.rating_result.configure(state="normal")
+        self.rating_result.delete("1.0", "end")
+        self.rating_result.insert("1.0", text)
+        self.rating_result.configure(state="disabled")
+
+    def _set_rating_date_today(self) -> None:
+        self.rating_date.set_date(date.today())
+
+    def _start_rating_lookup(self) -> None:
+        usernames = self._parse_usernames(self.rating_username_var.get())
+        if not usernames:
+            messagebox.showerror("Error", "Enter at least one username.")
+            return
+
+        try:
+            lookup_date = self.rating_date.get_date()
+        except Exception:
+            messagebox.showerror("Error", "Enter a valid date.")
+            return
+
+        self.rating_lookup_btn.configure(state="disabled")
+        self.rating_status_var.set("Looking up ratings...")
+        self._set_rating_result("")
+        self._save_settings_from_ui()
+        thread = threading.Thread(
+            target=self._lookup_ratings,
+            args=(
+                usernames,
+                lookup_date,
+                self.rating_leaderboard_var.get(),
+                self.rating_compact_var.get(),
+                self._rating_history_days(),
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def _finish_rating_lookup(self, status: str, result: str | None = None, error: bool = False) -> None:
+        self.rating_lookup_btn.configure(state="normal")
+        self.rating_status_var.set(status)
+        if result is not None:
+            self._set_rating_result(result)
+        if error:
+            messagebox.showerror("Error", status)
+
+    @staticmethod
+    def _format_utc_datetime(value: datetime | str) -> str:
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except (TypeError, ValueError, AttributeError):
+                return str(value or "unknown")
+
+        return dt.strftime("%d %b %Y, %H:%M:%S UTC")
+
+    @staticmethod
+    def _parse_usernames(value: str) -> list[str]:
+        usernames = []
+        seen = set()
+        for username in re.split(r"[,\s]+", value):
+            username = username.strip()
+            key = username.casefold()
+            if username and key not in seen:
+                usernames.append(username)
+                seen.add(key)
+        return usernames
+
+    def _lookup_ratings(
+        self,
+        usernames: list[str],
+        lookup_date: date,
+        leaderboard: str,
+        compact: bool,
+        history_days: int,
+    ) -> None:
+        try:
+            results = [
+                self._lookup_rating_data(username, lookup_date, leaderboard)
+                for username in usernames
+            ]
+            found = sum(1 for result in results if result["status"] == "found")
+            result_text = (
+                self._format_compact_rating_results(results)
+                if compact
+                else "\n\n".join(self._format_full_rating_result(result) for result in results)
+            )
+            status = f"Found ratings for {found} of {len(usernames)} player(s)."
+            append_rating_history({
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "usernames": ", ".join(usernames),
+                "date": lookup_date.strftime("%Y-%m-%d"),
+                "leaderboard": leaderboard,
+                "rating": self._rating_history_summary(results, "rating"),
+                "games": self._rating_history_summary(results, "total_games"),
+                "found": found,
+                "total": len(usernames),
+            })
+            prune_rating_history(history_days)
+            self.root.after(0, lambda: (
+                self._finish_rating_lookup(status, result_text),
+                self._refresh_rating_history_view(),
+            ))
+        except Exception as exc:
+            logger.exception("Rating lookup failed")
+            self.root.after(0, lambda e=str(exc): self._finish_rating_lookup(f"Error: {e}", error=True))
+
+    @staticmethod
+    def _rating_history_summary(results: list[dict], field: str) -> str:
+        values = []
+        for result in results:
+            if result["status"] == "found":
+                value = result.get(field)
+                values.append(str(value if value is not None else "unknown"))
+            else:
+                values.append("-")
+        return ", ".join(values[:3]) + (", ..." if len(values) > 3 else "")
+
+    def _lookup_rating_data(self, username: str, lookup_date: date, leaderboard: str) -> dict:
+        player_payload = self.client.get_json("/data/player", {
+            "page[size]": 1,
+            "filter": f"login=={self._rsql_quote(username)}",
+        })
+        players = player_payload.get("data", []) or []
+        if not players:
+            return {"status": "missing_player", "username": username, "message": "No player found."}
+
+        player = players[0]
+        player_attrs = self._jsonapi_attrs(player)
+        player_id = str(player.get("id"))
+        cutoff = datetime.combine(lookup_date, datetime_time(23, 59, 59)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        filters = [
+            f"gamePlayerStats.player.id=={player_id}",
+            f"leaderboard.technicalName=={self._rsql_quote(leaderboard)}",
+            f"createTime=le={self._rsql_quote(cutoff)}",
+        ]
+        journal_payload = self.client.get_json("/data/leaderboardRatingJournal", {
+            "page[size]": 1,
+            "sort": "-createTime",
+            "include": "leaderboard",
+            "filter": ";".join(filters),
+        })
+        entries = journal_payload.get("data", []) or []
+        if not entries:
+            return {
+                "status": "missing_rating",
+                "username": player_attrs.get("login", username),
+                "player_id": player_id,
+                "leaderboard": leaderboard,
+                "as_of": datetime.combine(lookup_date, datetime_time(23, 59, 59)),
+                "message": (
+                    f"Player exists, but no {leaderboard} rating journal entry was found on or before "
+                    f"{self._format_utc_datetime(datetime.combine(lookup_date, datetime_time(23, 59, 59)))}."
+                ),
+            }
+
+        entry = entries[0]
+        attrs = self._jsonapi_attrs(entry)
+        included = self._included_by_type_and_id(journal_payload)
+        leaderboard_id = self._relationship_id(entry, "leaderboard")
+        leaderboard_record = included.get(("leaderboard", leaderboard_id or ""), {})
+        leaderboard_attrs = leaderboard_record.get("attributes") or {}
+        leaderboard_name = (
+            leaderboard_attrs.get("technicalName")
+            or leaderboard_attrs.get("nameKey")
+            or leaderboard
+        )
+
+        mean = attrs.get("meanAfter")
+        deviation = attrs.get("deviationAfter")
+        rating = attrs.get("rating")
+        if rating is None and mean is not None and deviation is not None:
+            rating = int(float(mean) - 3 * float(deviation))
+        total_games = attrs.get("totalGames")
+        if total_games is None:
+            total_games = self._count_rating_journal_entries(filters)
+
+        return {
+            "status": "found",
+            "username": player_attrs.get("login", username),
+            "player_id": player_id,
+            "leaderboard": leaderboard_name,
+            "as_of": datetime.combine(lookup_date, datetime_time(23, 59, 59)),
+            "snapshot_time": attrs.get("createTime"),
+            "rating": rating,
+            "mean": mean,
+            "deviation": deviation,
+            "total_games": total_games,
+        }
+
+    def _count_rating_journal_entries(self, filters: list[str]) -> int | None:
+        page_size = 10_000
+        page_number = 1
+        total = 0
+
+        while True:
+            payload = self.client.get_json("/data/leaderboardRatingJournal", {
+                "page[size]": page_size,
+                "page[number]": page_number,
+                "filter": ";".join(filters),
+            })
+            entries = payload.get("data", []) or []
+            total += len(entries)
+            if len(entries) < page_size:
+                return total
+            page_number += 1
+
+    def _format_full_rating_result(self, result: dict) -> str:
+        if result["status"] == "missing_player":
+            return f"Player: {result['username']}\n{result['message']}"
+        if result["status"] == "missing_rating":
+            return f"Player: {result['username']} (id {result['player_id']})\n{result['message']}"
+
+        lines = [
+            f"Player: {result['username']} (id {result['player_id']})",
+            f"Leaderboard: {result['leaderboard']}",
+            f"As of: {self._format_utc_datetime(result['as_of'])}",
+            f"Latest rating change/snapshot: {self._format_utc_datetime(result['snapshot_time'])}",
+            "",
+            f"Displayed rating: {result['rating'] if result['rating'] is not None else 'unknown'}",
+            f"Mean after: {result['mean'] if result['mean'] is not None else 'unknown'}",
+            f"Deviation after: {result['deviation'] if result['deviation'] is not None else 'unknown'}",
+        ]
+        if result["total_games"] is not None:
+            lines.append(f"Total games: {result['total_games']}")
+        return "\n".join(lines)
+
+    def _format_compact_rating_results(self, results: list[dict]) -> str:
+        lines = ["Player | Board | Rating | Mean | Deviation | Games | Latest rating change/snapshot"]
+        lines.append("-" * 78)
+        for result in results:
+            if result["status"] != "found":
+                lines.append(f"{result['username']} | {result['message']}")
+                continue
+            lines.append(
+                f"{result['username']} | "
+                f"{result['leaderboard']} | "
+                f"{result['rating'] if result['rating'] is not None else 'unknown'} | "
+                f"{result['mean'] if result['mean'] is not None else 'unknown'} | "
+                f"{result['deviation'] if result['deviation'] is not None else 'unknown'} | "
+                f"{result['total_games'] if result['total_games'] is not None else 'unknown'} | "
+                f"{self._format_utc_datetime(result['snapshot_time'])}"
+            )
+        return "\n".join(lines)
+
+    def _lookup_rating(self, username: str, lookup_date: date, leaderboard: str) -> None:
+        try:
+            result = self._lookup_rating_data(username, lookup_date, leaderboard)
+            message = "Rating found." if result["status"] == "found" else "Rating not found."
+            self.root.after(0, lambda: self._finish_rating_lookup(message, self._format_full_rating_result(result)))
+        except Exception as exc:
+            logger.exception("Rating lookup failed")
+            self.root.after(0, lambda e=str(exc): self._finish_rating_lookup(f"Error: {e}", error=True))
 
     # ------------------------------------------------------------------
     # File / folder opening
