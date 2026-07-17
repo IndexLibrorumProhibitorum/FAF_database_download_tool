@@ -14,6 +14,7 @@ SCOPES = "openid offline upload_avatar administrative_actions read_sensible_user
 CHUNK_STATE_FILE  = Path("chunk_state.json")
 SETTINGS_FILE     = Path("settings.json")
 HISTORY_FILE      = Path("download_history.json")
+RATING_HISTORY_FILE = Path("rating_lookup_history.json")
 
 # Globals - API settings
 API_MAX_PAGE_SIZE = 10_000
@@ -36,4 +37,6 @@ ENDPOINT_META = {
 SETTINGS_KEYS = [
     "endpoint", "page_size", "max_pages", "filter", "include",
     "newest_first", "format", "chunk_pages", "all_in_range",
+    "rating_usernames", "rating_date", "rating_leaderboard",
+    "rating_compact", "rating_history_days",
 ]
